@@ -1,0 +1,240 @@
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use GuzzleHttp\Client;
+use GuzzleHttp\Cookie\CookieJar;
+use Illuminate\Support\Facades\Storage;
+
+class ScrapePttAddress extends Command
+{
+    protected $signature = 'scrape:ptt-address';
+    protected $description = 'PTT posta kodu sisteminden tüm adres verilerini çeker';
+
+    private $baseUrl = 'https://postakodu.ptt.gov.tr';
+    private $client;
+    private $cookieJar;
+    private $totalProvinces = 0;
+    private $currentProvince = 0;
+    private $totalDistricts = 0;
+    private $currentDistrict = 0;
+    private $totalNeighborhoods = 0;
+
+    public function __construct()
+    {
+        parent::__construct();
+        $this->cookieJar = new CookieJar();
+        $this->client = new Client([
+            'cookies' => $this->cookieJar,
+            'headers' => [
+                'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+                'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Content-Type' => 'application/x-www-form-urlencoded; charset=UTF-8'
+            ]
+        ]);
+    }
+
+    public function handle()
+    {
+        try {
+            $this->output->title('PTT Adres Verisi Çekme İşlemi Başlatılıyor');
+            $addressData = [];
+
+            $response = $this->client->get($this->baseUrl);
+            $html = (string) $response->getBody();
+
+            if (!preg_match('/MainContent_DropDownList1".*?>(.*?)<\/select>/s', $html, $provinceSelect)) {
+                throw new \Exception('İl listesi bulunamadı');
+            }
+
+            preg_match_all('/<option value="(\d+)">([^<]+)<\/option>/', $provinceSelect[1], $matches, PREG_SET_ORDER);
+
+            $this->totalProvinces = count($matches) - 1;
+
+            $mainProgress = $this->output->createProgressBar($this->totalProvinces);
+            $mainProgress->setFormat(
+                "\n%current%/%max% [%bar%] %percent:3s%%\n" .
+                "%message%\n"
+            );
+
+            $mainProgress->start();
+
+            foreach ($matches as $match) {
+                if ($match[1] == '-1') continue;
+
+                $provinceId = $match[1];
+                $provinceName = $this->cleanText($match[2]);
+
+                $mainProgress->setMessage("<fg=blue> {$provinceName} ili işleniyor...</>");
+
+                preg_match('/__VIEWSTATE" value="([^"]+)"/', $html, $viewstateMatch);
+                preg_match('/__EVENTVALIDATION" value="([^"]+)"/', $html, $eventvalidationMatch);
+
+                $response = $this->client->post($this->baseUrl, [
+                    'form_params' => [
+                        '__EVENTTARGET' => 'ctl00$MainContent$DropDownList1',
+                        '__EVENTARGUMENT' => '',
+                        '__VIEWSTATE' => $viewstateMatch[1],
+                        '__EVENTVALIDATION' => $eventvalidationMatch[1],
+                        'ctl00$MainContent$DropDownList1' => $provinceId
+                    ]
+                ]);
+
+                $districtHtml = (string) $response->getBody();
+
+                if (!preg_match('/MainContent_DropDownList2".*?>(.*?)<\/select>/s', $districtHtml, $districtSelect)) {
+                    continue;
+                }
+
+                preg_match_all('/<option value="(\d+)">([^<]+)<\/option>/', $districtSelect[1], $districtMatches, PREG_SET_ORDER);
+
+                $this->totalDistricts = count($districtMatches) - 1;
+                $this->currentDistrict = 0;
+
+                $districtProgress = $this->output->createProgressBar($this->totalDistricts);
+                $districtProgress->setFormat(
+                    "  %current%/%max% [%bar%] %percent:3s%%\n" .
+                    "  %message%\n"
+                );
+                $districtProgress->start();
+
+                $currentProvince = [
+                    'il_id' => $provinceId,
+                    'il_adi' => $provinceName,
+                    'ilceler' => []
+                ];
+
+                foreach ($districtMatches as $district) {
+                    if ($district[1] == '-1') continue;
+
+                    $districtId = $district[1];
+                    $districtName = $this->cleanText($district[2]);
+
+                    $districtProgress->setMessage("<fg=yellow> {$districtName} ilçesi işleniyor...</>");
+
+                    $neighborhoods = $this->getNeighborhoods($districtHtml, $provinceId, $districtId);
+
+                    $currentProvince['ilceler'][] = [
+                        'ilce_id' => $districtId,
+                        'ilce_adi' => $districtName,
+                        'mahalleler' => $neighborhoods
+                    ];
+
+                    if (empty($addressData)) {
+                        $addressData[] = $currentProvince;
+                    } else {
+                        $lastIndex = count($addressData) - 1;
+                        if ($addressData[$lastIndex]['il_id'] === $provinceId) {
+                            $addressData[$lastIndex] = $currentProvince;
+                        } else {
+                            $addressData[] = $currentProvince;
+                        }
+                    }
+
+                    Storage::put(
+                        'ptt_address_data.json',
+                        json_encode($addressData, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT)
+                    );
+
+                    $this->currentDistrict++;
+                    $districtProgress->advance();
+                    sleep(1);
+                }
+
+                $districtProgress->finish();
+                $mainProgress->advance();
+                sleep(2);
+            }
+
+            $mainProgress->finish();
+
+            $this->output->success(sprintf(
+                "\n\nİşlem tamamlandı!\n" .
+                "Toplam %d il, %d ilçe ve %d mahalle verisi çekildi.",
+                $this->totalProvinces,
+                $this->totalDistricts * $this->totalProvinces,
+                $this->totalNeighborhoods
+            ));
+
+        } catch (\Exception $e) {
+            $this->error('Hata: ' . $e->getMessage());
+            return Command::FAILURE;
+        }
+    }
+
+    private function getNeighborhoods($districtHtml, $provinceId, $districtId)
+    {
+        preg_match('/__VIEWSTATE" value="([^"]+)"/', $districtHtml, $newViewstateMatch);
+        preg_match('/__EVENTVALIDATION" value="([^"]+)"/', $districtHtml, $newEventvalidationMatch);
+
+        $response = $this->client->post($this->baseUrl, [
+            'form_params' => [
+                '__EVENTTARGET' => 'ctl00$MainContent$DropDownList2',
+                '__EVENTARGUMENT' => '',
+                '__VIEWSTATE' => $newViewstateMatch[1],
+                '__EVENTVALIDATION' => $newEventvalidationMatch[1],
+                'ctl00$MainContent$DropDownList1' => $provinceId,
+                'ctl00$MainContent$DropDownList2' => $districtId
+            ]
+        ]);
+
+        $neighborhoodHtml = (string) $response->getBody();
+        $neighborhoods = [];
+
+        if (preg_match('/MainContent_DropDownList3".*?>(.*?)<\/select>/s', $neighborhoodHtml, $neighborhoodSelect)) {
+            preg_match_all('/<option value="([^"]+)">([^<]+)<\/option>/', $neighborhoodSelect[1], $neighborhoodMatches, PREG_SET_ORDER);
+
+            foreach ($neighborhoodMatches as $neighborhood) {
+                if ($neighborhood[1] == '-1') continue;
+
+                $neighborhoodName = $this->cleanText($neighborhood[2]);
+
+                preg_match('/(\d{5})/', $neighborhoodName, $postalCodeMatch);
+                $postaKodu = $postalCodeMatch[1] ?? null;
+
+                $neighborhoodName = preg_replace('/\s*\/\s*.*$/', '', $neighborhoodName);
+
+                $neighborhoods[] = [
+                    'mahalle_id' => $this->cleanId($neighborhood[1]),
+                    'mahalle_adi' => $neighborhoodName,
+                    'posta_kodu' => $postaKodu
+                ];
+
+                $this->totalNeighborhoods++;
+                $this->line("    <fg=green> {$neighborhoodName} mahallesi eklendi.</>");
+            }
+        }
+
+        return $neighborhoods;
+    }
+
+    private function cleanText($text)
+    {
+        $text = html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+        // Başındaki ve sonundaki boşlukları temizle
+        $text = trim($text);
+
+        $text = preg_replace('/\s+/', ' ', $text);
+
+        $text = str_replace([
+            '&#214;', '&#220;', '&#199;', '&#286;', '&#304;', '&#350;',
+            'Ö', 'Ü', 'Ç', 'Ğ', 'İ', 'Ş', 'ö', 'ü', 'ç', 'ğ', 'ı', 'ş'
+        ], [
+            'O', 'U', 'C', 'G', 'I', 'S',
+            'O', 'U', 'C', 'G', 'I', 'S', 'o', 'u', 'c', 'g', 'i', 's'
+        ], $text);
+
+        return $text;
+    }
+
+    private function cleanId($id)
+    {
+        $id = str_replace(['\\', '/'], '_', $id);
+
+        $id = preg_replace('/[^a-zA-Z0-9_]/', '', $id);
+
+        return $id;
+    }
+}
